@@ -177,12 +177,14 @@ Initialization
 --------------
 
 The package needs to be initialized using the :func:`torch.distributed.init_process_group`
-function before calling any other methods. This blocks until all processes have
-joined.
+or :func:`torch.distributed.device_mesh.init_device_mesh` function before calling any other methods.
+Both block until all processes have joined.
 
 .. autofunction:: is_available
 
 .. autofunction:: init_process_group
+
+.. autofunction:: torch.distributed.device_mesh.init_device_mesh
 
 .. autofunction:: is_initialized
 
@@ -291,6 +293,36 @@ check whether the process group has already been initialized use :func:`torch.di
 
 .. autofunction:: get_world_size
 
+Shutdown
+--------
+
+It is important to clean up resources on exit by calling :func:`destroy_process_group`.
+
+The simplest pattern to follow is to destroy every process group and backend by calling
+:func:`destroy_process_group()` with the default value of None for the `group` argument, at a
+point in the training script where communications are no longer needed, usually near the
+end of main().  The call should be made once per trainer-process, not at the outer
+process-launcher level.
+
+if :func:`destroy_process_group` is not called by all ranks in a pg within the timeout duration,
+especially when there are multiple process-groups in the application e.g. for N-D parallelism,
+hangs on exit are possible.  This is because the destructor for ProcessGroupNCCL calls ncclCommAbort,
+which must be called collectively, but the order of calling ProcessGroupNCCL's destructor if called
+by python's GC is not deterministic. Calling :func:`destroy_process_group` helps by ensuring
+ncclCommAbort is called in a consistent order across ranks, and avoids calling ncclCommAbort
+during ProcessGroupNCCL's destructor.
+
+Reinitialization
+^^^^^^^^^^^^^^^^
+
+`destroy_process_group` can also be used to destroy individual process groups.  One use
+case could be fault tolerant training, where a process group may be destroyed and then
+a new one initialized during runtime.  In this case, it's critical to synchronize the trainer
+processes using some means other than torch.distributed primitives _after_ calling destroy and
+before subsequently initializing.  This behavior is currently unsupported/untested, due to
+the difficulty of achieving this synchronization, and is considered a known issue.  Please file
+a github issue or RFC if this is a use case that's blocking you.
+
 --------------------------------------------------------------------------------
 
 Distributed Key-Value Store
@@ -339,6 +371,18 @@ an opaque group handle that can be given as a ``group`` argument to all collecti
 
 .. autofunction:: get_process_group_ranks
 
+
+DeviceMesh
+----------
+
+DeviceMesh is a higher level abstraction that manages process groups (or NCCL communicators).
+It allows user to easily create inter node and intra node process groups without worrying about
+how to set up the ranks correctly for different sub process groups, and it helps manage those
+distributed process group easily. :func:`~torch.distributed.device_mesh.init_device_mesh` function can be
+used to create new DeviceMesh, with a mesh shape describing the device topology.
+
+.. autoclass:: torch.distributed.device_mesh.DeviceMesh
+
 Point-to-point communication
 ----------------------------
 
@@ -357,6 +401,10 @@ as they should never be created manually, but they are guaranteed to support two
 .. autofunction:: isend
 
 .. autofunction:: irecv
+
+.. autofunction:: send_object_list
+
+.. autofunction:: recv_object_list
 
 .. autofunction:: batch_isend_irecv
 
@@ -453,6 +501,8 @@ Collective functions
 
 .. autofunction:: monitored_barrier
 
+.. autoclass:: Work
+
 .. autoclass:: ReduceOp
 
 .. class:: reduce_op
@@ -544,6 +594,19 @@ Debugging ``torch.distributed`` applications
 
 Debugging distributed applications can be challenging due to hard to understand hangs, crashes, or inconsistent behavior across ranks. ``torch.distributed`` provides
 a suite of tools to help debug training applications in a self-serve fashion:
+
+Python Breakpoint
+^^^^^^^^^^^^^^^^^
+
+It is extremely convenient to use python's debugger in a distributed environment, but because it does not work out of the box many people do not use it at all.
+PyTorch offers a customized wrapper around pdb that streamlines the process.
+
+`torch.distributed.breakpoint` makes this process easy.  Internally, it customizes `pdb`'s breakpoint behavior in two ways but otherwise behaves as normal `pdb`.
+1. Attaches the debugger only on one rank (specified by the user).
+2. Ensures all other ranks stop, by using a `torch.distributed.barrier()` that will release once the debugged rank issues a `continue`
+3. Reroutes stdin from the child process such that it connects to your terminal.
+
+To use it, simply issue `torch.distributed.breakpoint(rank)` on all ranks, using the same value for `rank` in each case.
 
 Monitored Barrier
 ^^^^^^^^^^^^^^^^^
@@ -813,9 +876,6 @@ If you are running single node training, it may be convenient to interactively b
 .. py:module:: torch.distributed.nn.api
 .. py:module:: torch.distributed.nn.jit
 .. py:module:: torch.distributed.nn.jit.templates
-.. py:module:: torch.distributed.pipeline
-.. py:module:: torch.distributed.pipeline.sync
-.. py:module:: torch.distributed.pipeline.sync.skip
 .. py:module:: torch.distributed.tensor
 .. py:module:: torch.distributed.algorithms.ddp_comm_hooks.ddp_zero_hook
 .. py:module:: torch.distributed.algorithms.ddp_comm_hooks.debugging_hooks
@@ -841,10 +901,12 @@ If you are running single node training, it may be convenient to interactively b
 .. py:module:: torch.distributed.checkpoint.resharding
 .. py:module:: torch.distributed.checkpoint.state_dict_loader
 .. py:module:: torch.distributed.checkpoint.state_dict_saver
+.. py:module:: torch.distributed.checkpoint.stateful
 .. py:module:: torch.distributed.checkpoint.storage
 .. py:module:: torch.distributed.checkpoint.utils
 .. py:module:: torch.distributed.collective_utils
 .. py:module:: torch.distributed.constants
+.. py:module:: torch.distributed.device_mesh
 .. py:module:: torch.distributed.distributed_c10d
 .. py:module:: torch.distributed.elastic.agent.server.api
 .. py:module:: torch.distributed.elastic.agent.server.local_elastic_agent
@@ -899,22 +961,6 @@ If you are running single node training, it may be convenient to interactively b
 .. py:module:: torch.distributed.optim.post_localSGD_optimizer
 .. py:module:: torch.distributed.optim.utils
 .. py:module:: torch.distributed.optim.zero_redundancy_optimizer
-.. py:module:: torch.distributed.pipeline.sync.batchnorm
-.. py:module:: torch.distributed.pipeline.sync.checkpoint
-.. py:module:: torch.distributed.pipeline.sync.copy
-.. py:module:: torch.distributed.pipeline.sync.dependency
-.. py:module:: torch.distributed.pipeline.sync.microbatch
-.. py:module:: torch.distributed.pipeline.sync.phony
-.. py:module:: torch.distributed.pipeline.sync.pipe
-.. py:module:: torch.distributed.pipeline.sync.pipeline
-.. py:module:: torch.distributed.pipeline.sync.skip.layout
-.. py:module:: torch.distributed.pipeline.sync.skip.namespace
-.. py:module:: torch.distributed.pipeline.sync.skip.portal
-.. py:module:: torch.distributed.pipeline.sync.skip.skippable
-.. py:module:: torch.distributed.pipeline.sync.skip.tracker
-.. py:module:: torch.distributed.pipeline.sync.stream
-.. py:module:: torch.distributed.pipeline.sync.utils
-.. py:module:: torch.distributed.pipeline.sync.worker
 .. py:module:: torch.distributed.remote_device
 .. py:module:: torch.distributed.rendezvous
 .. py:module:: torch.distributed.rpc.api
@@ -929,6 +975,7 @@ If you are running single node training, it may be convenient to interactively b
 .. py:module:: torch.distributed.tensor.parallel.ddp
 .. py:module:: torch.distributed.tensor.parallel.fsdp
 .. py:module:: torch.distributed.tensor.parallel.input_reshard
+.. py:module:: torch.distributed.tensor.parallel.loss
 .. py:module:: torch.distributed.tensor.parallel.style
 .. py:module:: torch.distributed.utils
 .. py:module:: torch.distributed.checkpoint.state_dict

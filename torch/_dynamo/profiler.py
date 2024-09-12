@@ -1,9 +1,9 @@
+# mypy: allow-untyped-defs
 import dataclasses
 import os
 from typing import Any, List
 
 import torch
-from torch.fx.experimental.symbolic_shapes import has_free_symbols
 
 from .utils import print_once
 
@@ -38,7 +38,7 @@ class ProfileMetrics:
             self.fusions / max(1, other.fusions),
         )
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{self.operators:4.0%} ops {self.microseconds:4.0%} time"
 
     def tocsv(self):
@@ -46,7 +46,7 @@ class ProfileMetrics:
 
 
 class ProfileResult:
-    def __init__(self, captured, total, unique_graphs):
+    def __init__(self, captured, total, unique_graphs) -> None:
         self.captured: ProfileMetrics = captured or ProfileMetrics()
         self.total: ProfileMetrics = total or ProfileMetrics()
         self.unique_graphs: int = unique_graphs
@@ -60,7 +60,7 @@ class ProfileResult:
     def percent(self):
         return self.captured / self.total
 
-    def __str__(self):
+    def __str__(self) -> str:
         return (
             f"{self.unique_graphs:2} graphs {self.captured.graphs:2} graph calls "
             f"{self.captured.operators:4}/{self.total.operators:4} = "
@@ -92,7 +92,7 @@ def print_missing(stack):
 class Profiler:
     unique_graphs = 0
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.prof = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU],
             with_stack=should_print_missing(),
@@ -147,37 +147,10 @@ class Profiler:
         )
 
 
-def shapes_of(it):
-    if it:
-        return [tuple(getattr(x, "shape", [])) for x in it]
-
-
 def fx_insert_profiling(gm: torch.fx.GraphModule, example_inputs: List[Any]):
-    input_shapes = shapes_of(example_inputs)
-    output_shapes = None
-
-    def debug_print(extra):
-        gm.graph.print_tabular()
-        return f"shape mismatch in={input_shapes} out={output_shapes} got={extra}"
-
     def _wrapped(*args):
-        nonlocal output_shapes
         with torch.profiler.record_function("TORCHDYNAMO"):
-            # TODO: The assert here is a bit imprecise: if there are free
-            # symbols in the input shapes, we can still do the assert by
-            # doing matching and substitution.  However, I'm guessing that
-            # this assert doesn't matter too much so it's not worth the work
-            assert shapes_of(args) == input_shapes or any(
-                has_free_symbols(s) for s in input_shapes
-            ), debug_print(shapes_of(args))
-            result = gm.forward(*args)
-            if output_shapes is None:
-                output_shapes = shapes_of(result)
-            else:
-                assert shapes_of(result) == output_shapes or any(
-                    has_free_symbols(s) for s in input_shapes
-                ), debug_print(shapes_of(result))
-            return result
+            return gm.forward(*args)
 
     Profiler.unique_graphs += 1
     return _wrapped

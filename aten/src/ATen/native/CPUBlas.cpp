@@ -41,9 +41,7 @@ extern "C" void zaxpy_(int *n, void *a, const void *x, int *incx, void *y, int *
 #include <fbgemm/FbgemmI64.h>
 #endif  // USE_FBGEMM
 
-namespace at {
-namespace native {
-namespace cpublas {
+namespace at::native::cpublas {
 namespace internal {
 
 void normalize_last_dims(
@@ -73,7 +71,7 @@ void normalize_last_dims(
 }  // namespace internal
 
 namespace {
-
+C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wunneeded-internal-declaration")
 bool use_blas_gemm(
     TransposeType transa, TransposeType transb,
     int64_t m, int64_t n, int64_t k,
@@ -87,6 +85,7 @@ bool use_blas_gemm(
       (ldb >= std::max(int64_t{1}, (transb_ ? n : k))) &&
       (ldc >= std::max(int64_t{1}, m)));
 }
+C10_DIAGNOSTIC_POP()
 
 #ifdef USE_FBGEMM
 fbgemm::matrix_op_t to_fbgemm(TransposeType trans) {
@@ -166,6 +165,11 @@ void gemm(
     const float beta,
     float *c, int64_t ldc) {
   internal::normalize_last_dims(transa, transb, m, n, k, &lda, &ldb, &ldc);
+#if AT_MKLDNN_ENABLED()
+   if (mkldnn_bf32_gemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) {
+     return;
+   }
+#endif
 #if AT_BUILD_WITH_BLAS()
   if (use_blas_gemm(transa, transb, m, n, k, lda, ldb, ldc)) {
     int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
@@ -399,6 +403,42 @@ void gemm(
 void gemm(
     TransposeType transa, TransposeType transb,
     int64_t m, int64_t n, int64_t k,
+    const float alpha,
+    const at::Half *a, int64_t lda,
+    const at::Half *b, int64_t ldb,
+    const float beta,
+    float *c, int64_t ldc) {
+  internal::normalize_last_dims(transa, transb, m, n, k, &lda, &ldb, &ldc);
+#ifdef MKL_HAS_SHGEMM
+  if (use_blas_gemm(transa, transb, m, n, k, lda, ldb, ldc)) {
+    int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
+    mkl_gemm_f16f16f32(transa, transb, m_, n_, k_, alpha, a, lda_, b, ldb_, beta, c, ldc_);
+    return;
+  }
+#endif
+  // for the fallback path, first compute gemm with beta = 0,
+  // and then add c in full precision.
+  int64_t c_size = n * m;
+  std::vector<at::Half> float16_c(c_size, 0.f);
+  gemm_stub(
+      at::kCPU, at::kHalf,
+      transa, transb, m, n, k, alpha, a, lda, b, ldb, 0.f, float16_c.data(), m);
+  for (const auto j : c10::irange(n)) {
+    for (const auto i : c10::irange(m)) {
+      auto offset = j * ldc + i;
+      // beta == 0 won't propagate NaN from C
+      if (beta == 0.f) {
+        c[offset] = c10::convert<float>(float16_c[j * m + i]);
+      } else {
+        c[offset] = beta * c[offset] + c10::convert<float>(float16_c[j * m + i]);
+      }
+    }
+  }
+}
+
+void gemm(
+    TransposeType transa, TransposeType transb,
+    int64_t m, int64_t n, int64_t k,
     const int64_t alpha,
     const int64_t *a, int64_t lda,
     const int64_t *b, int64_t ldb,
@@ -458,10 +498,10 @@ static void gemm_batched_mkl_impl(
 
 template <typename scalar_t>
 using is_blas_library_type = std::integral_constant<bool,
-    std::is_same<scalar_t, double>::value ||
-    std::is_same<scalar_t, float>::value ||
-    std::is_same<scalar_t, c10::complex<double>>::value ||
-    std::is_same<scalar_t, c10::complex<float>>::value>;
+    std::is_same_v<scalar_t, double> ||
+    std::is_same_v<scalar_t, float> ||
+    std::is_same_v<scalar_t, c10::complex<double>> ||
+    std::is_same_v<scalar_t, c10::complex<float>>>;
 
 template <typename scalar_t>
 void gemm_batched_generic(
@@ -782,4 +822,4 @@ void copy(int64_t n, const c10::complex<float> *x, int64_t incx, c10::complex<fl
       n, x, incx, y, incy);
 }
 
-}}}  // namespace at::native::cpublas
+}  // namespace at::native::cpublas

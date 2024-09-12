@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 # NOTE: This file is referenced by name at
 #       /opt/pytorch/torch/_dynamo/eval_frame.py::DONT_WRAP_FILES.
 #       introduced by https://github.com/pytorch/pytorch/pull/98894.
@@ -5,16 +6,20 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping, Optional, Sequence, Union
+from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
 
 import torch._dynamo
 import torch.fx
-import torch.onnx
-from torch.onnx._internal import _beartype, exporter, io_adapter
+from torch.onnx._internal import _exporter_legacy, io_adapter
 from torch.onnx._internal.diagnostics import infra
 
 
-class TorchExport(exporter.FXGraphExtractor):
+if TYPE_CHECKING:
+    import torch.onnx
+    from torch.export.exported_program import ExportedProgram
+
+
+class TorchExport(_exporter_legacy.FXGraphExtractor):
     """Generates a FX GraphModule using torch.export API
     Args:
         aten_graph: If True, exports a graph with ATen operators.
@@ -23,15 +28,15 @@ class TorchExport(exporter.FXGraphExtractor):
 
     def __init__(
         self,
-        aten_graph: Optional[bool] = None,
+        aten_graph: bool | None = None,
     ):
         super().__init__()
         self.aten_graph = aten_graph or True
 
     def generate_fx(
         self,
-        options: exporter.ResolvedExportOptions,
-        model: "ExportedProgram",  # type: ignore[name-defined]
+        options: _exporter_legacy.ResolvedExportOptions,
+        model: ExportedProgram,  # type: ignore[override]
         model_args: Sequence[Any],
         model_kwargs: Mapping[str, Any],
     ) -> torch.fx.GraphModule:
@@ -43,38 +48,61 @@ class TorchExport(exporter.FXGraphExtractor):
         #         kwargs=model_kwargs,  # type: ignore[arg-type]
         #     )
 
-        model = model.run_decompositions(options.decomposition_table)
-
         # Export FX graph to ONNX ModelProto.
         self.input_adapter.append_step(
             io_adapter.FlattenInputWithTreeSpecValidationInputStep()
         )
         self.input_adapter.append_step(
-            io_adapter.PrependParamsAndBuffersAotAutogradInputStep(model)
+            io_adapter.PrependParamsBuffersConstantAotAutogradInputStep()
         )
 
         # ONNX does not support None inputs. During graph building, all None inputs
         # are removed. Here we register this step to input adapter.
         options.fx_tracer.input_adapter.append_step(io_adapter.RemoveNoneInputStep())
 
-        updated_model_args = self.input_adapter.apply(*model_args, **model_kwargs)
+        # NOTE: temp workaround for https://github.com/pytorch/pytorch/issues/99534
+        # Dynamo doesn't support non-tensor inputs.
+        options.fx_tracer.input_adapter.append_step(
+            io_adapter.RemoveNonTensorInputStep()
+        )
+
+        # ONNX does not support complex inputs. During graph building, all complex inputs
+        # are converted to real representation inputs. Here we register this step to
+        # input/output adapter.
+        options.fx_tracer.input_adapter.append_step(
+            io_adapter.ConvertComplexToRealRepresentationInputStep()
+        )
+
+        updated_model_args = self.input_adapter.apply(
+            *model_args, model=model, **model_kwargs
+        )
 
         # ONNX can't represent collection types (e.g., dictionary, tuple of tuple of
         # tensor, etc), we flatten the collection and register each element as output.
         options.fx_tracer.output_adapter.append_step(io_adapter.FlattenOutputStep())
 
+        # Output post-processing steps should happen after `FlattenOutputStep`.
         options.fx_tracer.output_adapter.append_step(
-            io_adapter.PrependParamsAndBuffersAotAutogradOutputStep(model)
+            io_adapter.ConvertComplexToRealRepresentationOutputStep()
         )
 
-        # Export FX graph to ONNX ModelProto.
-        return self.pre_export_passes(options, model, model.graph_module, updated_model_args)  # type: ignore[return-value]
+        options.fx_tracer.output_adapter.append_step(
+            io_adapter.PrependParamsAndBuffersAotAutogradOutputStep()
+        )
 
-    @_beartype.beartype
+        # run_decomposition generates a new graph module with decomposed ops.
+        # Thus, we need to run this step after io_adapters.
+        model = model.run_decompositions(options.decomposition_table)
+
+        # Export FX graph to ONNX ModelProto.
+        return self.pre_export_passes(  # type: ignore[return-value]
+            options, model, model.graph_module, updated_model_args
+        )
+
     def pre_export_passes(
         self,
-        options: exporter.ResolvedExportOptions,
-        original_model: Union[torch.nn.Module, Callable],
+        options: _exporter_legacy.ResolvedExportOptions,
+        original_model: torch.nn.Module | Callable,
         fx_module: torch.fx.GraphModule,
         fx_module_args: Sequence[Any],
     ):
@@ -91,9 +119,10 @@ class TorchExport(exporter.FXGraphExtractor):
             diagnostic_context, fx_module, options.onnxfunction_dispatcher
         ).analyze(infra.levels.ERROR)
 
-        # TODO: Disabled this pass until "Segmentation fault (core dumped)" is fixed
         # This operation should be invoked as the last pre export pass.
         # See [NOTE: Modularize pass ordering]
-        # fx_module = passes.Modularize(diagnostic_context, fx_module).run()
+        fx_module = passes.Modularize(
+            diagnostic_context, fx_module, is_exported_program=True
+        ).run()
 
         return fx_module

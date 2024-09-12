@@ -1,3 +1,5 @@
+# mypy: ignore-errors
+
 import functools
 import warnings
 from typing import Callable, Union
@@ -47,7 +49,10 @@ def output_alias_each_other(outputs):
 
 def is_sdpa_error(func, idx, e):
     if (
-        func is aten._scaled_dot_product_flash_attention.default
+        (
+            func is aten._scaled_dot_product_flash_attention.default
+            or func is aten._flash_attention_forward.default
+        )
         and idx in (6, 7)
         and "Devices" in repr(e)
     ):
@@ -58,6 +63,12 @@ def is_sdpa_error(func, idx, e):
             or func is aten._efficient_attention_forward.default
         )
         and idx in (2, 3)
+        and "Devices" in repr(e)
+    ):
+        return True
+    if (
+        func is aten._scaled_dot_product_cudnn_attention.default
+        and idx in (6, 7)
         and "Devices" in repr(e)
     ):
         return True
@@ -72,6 +83,7 @@ class CrossRefFakeMode(TorchDispatchMode):
         check_strides=True,
         check_aliasing=True,
     ):
+        super().__init__()
         self.ignore_op_fn = (
             ignore_op_fn if ignore_op_fn is not None else lambda fn: False
         )
